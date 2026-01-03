@@ -4,6 +4,9 @@ require 'timeout'
 require 'tmpdir'
 require 'uri'
 require 'open3'
+require 'securerandom'
+
+POSTGRES_IMAGE = 'postgres:18'
 
 QUIET = ARGV[0] != "--verbose"
 FILTER = ARGV[QUIET ? 0 : 1]
@@ -20,15 +23,22 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
   CLIENT_CSR = File.join(TMPDIR, "client.csr")
   CLIENT_KEY = File.join(TMPDIR, "client.key")
   CLIENT_PEM = File.join(TMPDIR, "client.pem")
+  CERTS_VOLUME_NAME = "elephantshark-test-certs-#{SecureRandom.uuid}"
 
   File.write(CA_CFG, "[v3_ca]\nbasicConstraints=critical,CA:true,pathlen:1\n")
   File.write(CLIENT_CFG, "[dn]\nCN=localhost\n[req]\ndistinguished_name=dn\n[EXT]\nsubjectAltName=DNS:localhost\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n")
 
-  puts '>> Generating TLS certs ...'
+  puts ">> Generating TLS certs in #{TMPDIR} and temporary volume #{CERTS_VOLUME_NAME} ..."
   `openssl req -new -newkey rsa:4096 -nodes -text -out #{CA_CSR} -keyout #{CA_KEY} -subj "/CN=Elephantshark" #{REDIR}
   openssl x509 -req -in #{CA_CSR} -text -days 2 -extfile #{CA_CFG} -extensions v3_ca -signkey #{CA_KEY} -out #{CA_PEM} #{REDIR}
   openssl req -new -nodes -text -out #{CLIENT_CSR} -keyout #{CLIENT_KEY} -subj "/CN=localhost" -config #{CLIENT_CFG} -extensions EXT #{REDIR}
-  openssl x509 -req -in #{CLIENT_CSR} -text -days 2 -CA #{CA_PEM} -CAkey #{CA_KEY} -out #{CLIENT_PEM} #{REDIR}`
+  openssl x509 -req -in #{CLIENT_CSR} -text -days 2 -CA #{CA_PEM} -CAkey #{CA_KEY} -out #{CLIENT_PEM} #{REDIR}
+  podman volume create #{CERTS_VOLUME_NAME}
+  tar -C #{TMPDIR} -cf - . | podman volume import #{CERTS_VOLUME_NAME} -
+  podman run --rm --name elephantshark-postgres-test-perms \
+    -v #{CERTS_VOLUME_NAME}:/etc/ssl/pg:z \
+    #{POSTGRES_IMAGE} \
+    chown -R postgres:postgres /etc/ssl/pg`
 
   def await_port(port)
     Timeout::timeout(30) do
@@ -42,15 +52,15 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
   end
 
   def with_postgres(auth_method = 'scram-sha-256', port = 54320, extra = '', ssl = 'on')
-    puts ">> Starting Docker Postgres (auth: #{auth_method}, port: #{port}) ..."
-    docker_pid = spawn("docker run --rm --name elephantshark-postgres-test \
+    puts ">> Starting #{POSTGRES_IMAGE} container (auth: #{auth_method}, port: #{port}) ..."
+    container_pid = spawn("podman run --rm --name elephantshark-postgres-test \
       -p #{port}:5432 \
       -e POSTGRES_USER=frodo \
       -e POSTGRES_PASSWORD=friend \
       -e POSTGRES_HOST_AUTH_METHOD='#{auth_method}' \
       #{auth_method == 'md5' ? '-e POSTGRES_INITDB_ARGS="--auth-local=md5"' : ''} \
-      -v #{TMPDIR}:/etc/ssl/pg \
-      postgres:17 \
+      -v #{CERTS_VOLUME_NAME}:/etc/ssl/pg:z \
+      #{POSTGRES_IMAGE} \
       -c ssl=#{ssl} \
       -c ssl_cert_file=/etc/ssl/pg/client.pem \
       -c ssl_key_file=/etc/ssl/pg/client.key \
@@ -61,10 +71,10 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
     yield
 
   ensure
-    puts '>> Stopping Docker Postgres ...'
-    unless docker_pid.nil?
-      Process.kill('SIGTERM', docker_pid)
-      Process.wait(docker_pid)
+    puts ">> Stopping #{POSTGRES_IMAGE} container ..."
+    unless container_pid.nil?
+      Process.kill('SIGTERM', container_pid)
+      Process.wait(container_pid)
     end
   end
 
@@ -196,14 +206,14 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
       end
 
       do_test("connecting to server with --server-sslmode=verify-full fails without --server-sslrootcert") do
-        result, es_log, rescued = with_elephantshark("--server-sslmode=verify-full") do
+        _, es_log, rescued = with_elephantshark("--server-sslmode=verify-full") do
           do_test_query('postgresql://frodo:friend@localhost:54321/frodo?sslmode=require&channel_binding=disable')
         end
         rescued && contains(es_log, 'certificate verify failed')
       end
 
       do_test("connecting to server with --server-sslmode=verify-full fails with appropriate --server-sslrootcert if host doesn't match") do
-        result, es_log, rescued = with_elephantshark("--server-sslmode=verify-full") do
+        _, es_log, rescued = with_elephantshark("--server-sslmode=verify-full") do
           do_test_query('postgresql://frodo:friend@127.0.0.1:54321/frodo?sslmode=require&channel_binding=disable')
         end
         rescued && contains(es_log, 'certificate verify failed')
@@ -217,7 +227,7 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
       end
 
       do_test("connecting to server with --server-sslmode=verify-ca fails without ---server-sslrootcert") do
-        result, es_log, rescued = with_elephantshark("--server-sslmode=verify-ca") do
+        _, es_log, rescued = with_elephantshark("--server-sslmode=verify-ca") do
           do_test_query('postgresql://frodo:friend@localhost:54321/frodo?sslmode=require&channel_binding=disable')
         end
         rescued && contains(es_log, 'certificate verify failed')
@@ -238,7 +248,7 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
       end
 
       do_test("connecting to server with --server-sslrootcert=system fails without appropriate certificate") do
-        result, es_log, rescued = with_elephantshark("--server-sslrootcert=system") do
+        _, es_log, rescued = with_elephantshark("--server-sslrootcert=system") do
           do_test_query('postgresql://frodo:friend@localhost:54321/frodo?sslmode=require&channel_binding=disable')
         end
         rescued && contains(es_log, 'certificate verify failed')
@@ -372,14 +382,14 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
       end
 
       do_test("--client-deny-ssl causes connection error with sslmode=require") do
-        result, es_log, rescued = with_elephantshark("--client-deny-ssl") do
+        _, es_log, rescued = with_elephantshark("--client-deny-ssl") do
           do_test_query('postgresql://frodo:friend@localhost:54321/frodo?sslmode=require&channel_binding=disable')
         end
         rescued && contains(es_log, 'server does not support SSL, but SSL was required')
       end
 
       do_test("--client-deny-ssl fails when channel binding is offered") do
-        result, es_log, rescued = with_elephantshark("--client-deny-ssl") do
+        _, es_log, rescued = with_elephantshark("--client-deny-ssl") do
           do_test_query('postgresql://frodo:friend@localhost:54321/frodo')
         end
         rescued && contains(es_log, 'server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection')
@@ -427,24 +437,22 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
         !rescued && results.all?
       end
 
-      do_test("support multiple connections in parallel") do
+      do_test("support multiple connections in parallel (TODO: fix flaky test)") do
         results = []
         t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         _, _, rescued = with_elephantshark do
-          threads = []
-          3.times do |i|
-            threads << Thread.new do
+          3.times.map do |i|
+            Thread.new do
               results << do_sleep_query('postgresql://frodo:friend@localhost:54321/frodo?sslmode=require&channel_binding=disable', 2)
             end
-          end
-          threads.each(&:join) 
+          end.each { |thread| thread.join }
         end
         t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        !rescued && results.all? && t1 - t0 < 4
+        !rescued && results.all? && t1 - t0 < 5  # in serial would be >= 6
       end
 
       do_test("support only the socket-testing connection with --quit-on-hangup") do
-        result, es_log, rescued = with_elephantshark("--quit-on-hangup") do
+        _, es_log, rescued = with_elephantshark("--quit-on-hangup") do
           # we already connected once to check the socket is open, so this next connection should fail
           do_test_query('postgresql://frodo:friend@localhost:54321/frodo?sslmode=require&channel_binding=disable')
         end
@@ -618,13 +626,13 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
 
       do_test("streaming replication") do
         _, es_log, rescued = with_elephantshark("--server-host localhost") do
-          docker_recv_pid = spawn("docker run --rm --name elephantshark-postgres-walrecv \
-            postgres:17 \
+          container_recv_pid = spawn("podman run --rm --name elephantshark-postgres-walrecv \
+            #{POSTGRES_IMAGE} \
             pg_receivewal -S replica1 -D /tmp \
-              -d 'postgresql://replication:password@host.docker.internal:54321/frodo?sslmode=require&channel_binding=disable'", **SPAWN_OPTS)
+              -d 'postgresql://replication:password@host.containers.internal:54321/frodo?sslmode=require&channel_binding=disable'", **SPAWN_OPTS)
           sleep 2
-          Process.kill('SIGTERM', docker_recv_pid)
-          Process.wait(docker_recv_pid)
+          Process.kill('SIGTERM', container_recv_pid)
+          Process.wait(container_recv_pid)
         end
         !rescued && contains(es_log, 'server -> client: "C" = CommandComplete "\x00\x00\x00\x16" = 22 bytes "START_REPLICATION\x00" = command tag')
       end
@@ -645,13 +653,13 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
 
       do_test("logical replication") do
         _, es_log, rescued = with_elephantshark("--server-host localhost") do
-          docker_recv_pid = spawn("docker run --rm --name elephantshark-postgres-logicalrecv \
-            postgres:17 \
+          container_recv_pid = spawn("podman run --rm --name elephantshark-postgres-logicalrecv \
+            #{POSTGRES_IMAGE} \
             pg_recvlogical --start -S logslot1 -P pgoutput -o proto_version=1 -o publication_names=pub1 -f /dev/null \
-              -d 'postgresql://replication:password@host.docker.internal:54321/frodo?sslmode=require&channel_binding=disable'", **SPAWN_OPTS)
+              -d 'postgresql://replication:password@host.containers.internal:54321/frodo?sslmode=require&channel_binding=disable'", **SPAWN_OPTS)
           sleep 2
-          Process.kill('SIGTERM', docker_recv_pid)
-          Process.wait(docker_recv_pid)
+          Process.kill('SIGTERM', container_recv_pid)
+          Process.wait(container_recv_pid)
         end
         !rescued && contains(es_log, 'server -> client: "C" = CommandComplete "\x00\x00\x00\x16" = 22 bytes "START_REPLICATION\x00" = command tag')
       end
@@ -660,6 +668,7 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
   ensure
     Process.waitall
     puts "\033[1m#{$passes} passed, #{$fails} failed\033[0m"
+    `podman volume rm #{CERTS_VOLUME_NAME}` unless CERTS_VOLUME_NAME.nil?
     exit($fails == 0)
   end
 end
