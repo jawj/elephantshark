@@ -216,14 +216,16 @@ class PgMessage
     if @source == :startup # also CancelRequest
       lenv, lenr, versionmajv, versionmajr, versionminv, versionminr = int32 + int16 + int16
       if versionmajv == 1234 && versionminv == 5678
-        s += annotate(lenr, "#{lenv} bytes of CancelRequest message", versionmajr, "cancel code: #{versionmajv}", versionminr, "cancel code: #{versionminv}")
+        s += annotate(lenr, "#{lenv} bytes of CancelRequest message")
+        s += "\n" + annotate(versionmajr, "cancel code: #{versionmajv}", versionminr, "cancel code: #{versionminv}")
         processidv, processidr = int32
         _, secretkeyr = bytes(lenv - 12) # 12 bytes = skipping the 3 int32s we already read
         s += "\n" + annotate(processidr, "target backend process ID: #{processidv}")
         s += "\n" + annotate(secretkeyr, "target backend secret key")
 
       else
-        s += annotate(lenr, "#{lenv} bytes of startup message", versionmajr, "protocol major version #{versionmajv}", versionminr, "protocol minor version #{versionminv}")
+        s += annotate(lenr, "#{lenv} bytes of startup message")
+        s += "\n" + annotate(versionmajr, "protocol major version #{versionmajv}", versionminr, "protocol minor version #{versionminv}")
         loop do
           keyv, keyr, = cstr
           if keyv.empty?
@@ -424,10 +426,10 @@ class PgMessage
           "ParameterDescription"
 
         when "v"
-          protov, protor = int32
-          s += annotate(protor, "newest minor protocol version supported: #{protov}")
+          protomajv, protomajr, protominv, protominr = int16 + int16
+          s += "\n" + annotate(protomajr, "supported protocol major version: #{protomajv}", protominr, "supported protocol minor version: #{protominv}")
           optioncountv, optioncountr = int32
-          s += annotate(optioncountr, "number of unrecognised protocol options: #{optioncountv}")
+          s += "\n" + annotate(optioncountr, "number of unrecognised protocol options: #{optioncountv}")
           optioncountv.times do
             _, optionr = cstr
             s += "\n" + annotate(optionr, "unrecognised option")
@@ -544,7 +546,7 @@ class PgMessage
             _, mechr  = cstr
             s += "\n" + annotate(mechr, "selected mechanism")
             scramlenv, scramlenr = int32
-            s += "\n" + annotate(scramlenr, "#{scramlenv} bytes follow")
+            s += " " + annotate(scramlenr, "#{scramlenv} bytes follow")
             _, scramdata = str(scramlenv)
             s += "\n" + annotate(scramdata, "SCRAM client-first-message")
             "SASLInitialResponse"
