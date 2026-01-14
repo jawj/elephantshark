@@ -619,7 +619,7 @@ class BufferingConnection
   def nonblocking_buffer_to(length)
     return true if @buffer.length >= length
     begin
-      bytes = @sock.read_nonblock((1 << 31) - 1) # maximum possible read
+      bytes = @sock.read_nonblock(65536) # read up to 64KB at a time
       @buffer += bytes
       @buffer.length >= length # return true or false
     rescue OpenSSL::SSL::SSLErrorWaitReadable, OpenSSL::SSL::SSLErrorWaitWritable, IO::EAGAINWaitReadable
