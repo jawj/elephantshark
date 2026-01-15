@@ -462,10 +462,10 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
         rescued && contains(es_log, 'Connection refused')
       end
 
-      do_test("handle cancelling") do
+      do_test("handle encrypted CancelRequest") do
         t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        _, es_log, rescued = with_elephantshark do
-          PG.connect('postgresql://frodo:friend@localhost:54321/frodo?sslmode=require&channel_binding=disable') do |conn|
+        _, es_log, rescued = with_elephantshark('--server-delete-suffix none.please') do
+          PG.connect('postgresql://frodo:friend@this-machine.local.neon.build:54321/frodo?sslmode=require&channel_binding=disable') do |conn|
             Thread.new do
               sleep(1)
               conn.cancel
@@ -475,6 +475,22 @@ Dir.mktmpdir('elephantshark-tests') do |tmpdir|
         end
         t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         rescued && contains(es_log, "canceling statement due to user request") && t1 - t0 < 5
+      end
+
+      do_test("handle psql's unencrypted CancelRequest") do
+        t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        _, es_log, rescued = with_elephantshark('--server-delete-suffix none.please') do
+          rpipe, wpipe = IO.pipe
+          pid = spawn('psql', 'postgresql://frodo:friend@this-machine.local.neon.build:54321/frodo?sslmode=require&channel_binding=disable', in: rpipe)
+          rpipe.close
+          wpipe.puts('SELECT pg_sleep(10);')
+          wpipe.close
+          sleep(1)
+          Process.kill('SIGINT', pid)
+          Process.wait(pid)
+        end
+        t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        !rescued && contains(es_log, "using remembered host for CancelRequest connection") && contains(es_log, "canceling statement due to user request") && t1 - t0 < 5
       end
 
       do_test("SSLKEYLOGFILE writing") do

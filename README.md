@@ -31,6 +31,8 @@ On macOS, install Elephantshark via Homebrew tap:
 
 Or on any platform, simply download [the `elephantshark` script](elephantshark) and run it using Ruby 3.3 or higher (earlier Ruby versions may support some but not all features). It has no dependencies beyond the Ruby standard library.
 
+(TruffleRuby, tested at version 33.0, appears to run elephantshark without issues. JRuby, tested at version 10.0, does not.)
+
 
 ## Example session
 
@@ -148,7 +150,7 @@ Back in the first terminal, see what bytes got exchanged:
 
 ```text
 % elephantshark --help
-Elephantshark v0.2.2, Postgres network traffic monitor
+Elephantshark v0.3, Postgres network traffic monitor
 https://github.com/neondatabase/elephantshark ++ Copyright 2025 - 2026 Databricks, Inc. ++ License: Apache 2.0
 
 Usage:
@@ -211,7 +213,7 @@ It’s also possible to:
 
 * Configure Elephantshark to strip a different domain suffix using the option `--server-delete-suffix .abc.xyz`.
 
-* Specify a fixed server hostname, instead of getting it via SNI from the client, using the `--server-host db.blah.xyz` option. This is useful especially for unencrypted client connections, for which SNI is unavailable. Note that a CancelRequest message (e.g. as sent by psql when you press Ctrl-C) always travels over an unencrypted connection: to make that work as expected you should therefore specify an explicit `--server-host`.
+* Specify a fixed server hostname, instead of getting it via SNI from the client, using the `--server-host db.blah.xyz` option. This is useful for unencrypted client connections, for which SNI is unavailable.
 
 #### Everything local: Postgres, Elephantshark and client
 
@@ -313,18 +315,18 @@ If using Wireshark, you might also want to specify `--log-forwarded none`.
 
 ### Tests
 
-To run the tests, ensure Ruby, podman and OpenSSL are on your `PATH`. Then clone this repo and from the root directory:
+To run the tests, ensure Ruby, podman, OpenSSL and psql are on your `PATH`. Then clone this repo and from the root directory:
 
 * Get the `pg` gem: `gem install pg`
 * Optionally, create a file `tests/.env` containing `DATABASE_URL="postgresql://..."` which must point to a database with a PKI-signed SSL cert (e.g. on Neon)
 * Run `tests/test.sh` — or to see OpenSSL, podman and Elephantshark output alongside test results, `tests/test.sh --verbose`
 
 
-### Change log
+### High-level change log
 
 * 0.1: Initial release
 * 0.2: Support for parallel connections (logged as #1, #2, etc.)
-
+* 0.3: Honour unencrypted `CancelRequest` messages (no SNI) by remembering server host names
 
 ### License
 

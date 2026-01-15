@@ -24,7 +24,7 @@ Thread.abort_on_exception = true
 Thread.report_on_exception = false
 
 SCRIPT_NAME = "Elephantshark" # note: name must be valid as a certificate CN
-SCRIPT_VERS = '0.2.2'
+SCRIPT_VERS = '0.3'
 SCRIPT_DESC = "Postgres network traffic monitor"
 SCRIPT_INFO = "https://github.com/neondatabase/elephantshark ++ Copyright 2025 - 2026 Databricks, Inc. ++ License: Apache 2.0"
 
@@ -110,19 +110,6 @@ REDACT = options[:redact_passwords]
 BYTE_WRITE = options[:send_chunks] == "byte"
 COLOURFUL = options[:bw].nil? ? STDOUT.tty? : !options[:bw]
 
-# Ruby stdlib compatibility checks
-
-has_sasl = Net::IMAP.const_defined?(:SASL) && Net::IMAP::SASL.const_defined?(:ScramSHA256Authenticator)
-if options[:force_password] && !has_sasl
-  puts "Missing Net::IMAP::SASL::ScramSHA256Authenticator, so --override-auth will not support SCRAM. Please use Ruby 3.3 or higher."
-  # we'll exit later if SCRAM is requested by server
-end
-
-if options[:cert_sig] == "ecdsa" && !OpenSSL::PKey::EC.method_defined?(:public_to_pem)
-  puts "Missing OpenSSL::PKey::EC#public_to_pem, so --client-cert-sig ecdsa is not supported. Please use Ruby 3.1 or higher."
-  exit 1
-end
-
 # misc utils
 
 def bin_str(str) str.force_encoding("ASCII-8BIT") end
@@ -138,6 +125,7 @@ module Colour
   NOTE = "33"
   CONN = "34"
   LEN = "34"
+  WARN = "1"
 end
 
 def colour(c, s) COLOURFUL ? "\033[#{c}m#{s}\033[0m": s end
@@ -155,12 +143,61 @@ def client_to_server(s) "#{colour(Colour::C2S, "client -> server:")} #{s}" end
 def client_to_script(s) "#{colour(Colour::C2S, "client -> script:")} #{s}" end
 def script_to_server(s) "#{colour(Colour::C2S, "script -> server:")} #{s}" end
 
+# Ruby compatibility checks
+
+case RUBY_ENGINE
+when "ruby", "truffleruby"
+  # MRI: supported
+  # TruffleRuby: seems to work
+when "jruby"
+  # JRuby: `recv(n, Socket::MSG_PEEK)` is missing as of v10
+  puts(colour(Colour::WARN, "JRuby is not compatible with elephantshark: expect trouble"))
+else
+  # mruby: already failed at `require`
+  # picoruby: already failed parsing Regexp literals
+  puts(colour(Colour::WARN, "RUBY_ENGINE '#{RUBY_ENGINE}': compatibility unknown"))
+end
+
+has_sasl = Net::IMAP.const_defined?(:SASL) && Net::IMAP::SASL.const_defined?(:ScramSHA256Authenticator)
+if options[:force_password] && !has_sasl
+  puts(colour(Colour::WARN, "Missing Net::IMAP::SASL::ScramSHA256Authenticator, so --override-auth will not support SCRAM. Please use Ruby 3.3 or higher."))
+  # we'll exit later if SCRAM is requested by server
+end
+
+if options[:cert_sig] == "ecdsa" && !OpenSSL::PKey::EC.method_defined?(:public_to_pem)
+  puts(colour(Colour::WARN, "Missing OpenSSL::PKey::EC#public_to_pem, so --client-cert-sig ecdsa is not supported. Please use Ruby 3.1 or higher."))
+  exit 1
+end
+
+# simple thread-safe Hash (probably unnecessary for MRI, at least)
+
+class SafeHash
+  def initialize
+    @hash = {}
+    @mutex = Mutex.new
+  end
+  def [](key)
+    @mutex.synchronize { @hash[key] }
+  end
+  def []=(key, value)
+    @mutex.synchronize { @hash[key] = value }
+  end
+  def delete(key)
+    @mutex.synchronize { @hash.delete(key) }
+  end
+  def mutate(key)
+    @mutex.synchronize { @hash[key] = yield(@hash[key]) }
+  end
+end
+
+
 # Postgres message parsing/annotation
 
 class PgMessage
-  def initialize(msg, source)
+  def initialize(msg, source, conn_num)
     @msg = msg
     @source = source # :server, :client, :startup or nil
+    @conn_num = conn_num
     @i = 0
   end
 
@@ -216,10 +253,11 @@ class PgMessage
       if versionmajv == 1234 && versionminv == 5678
         s += annotate(lenr, "#{lenv} bytes of CancelRequest message")
         s += "\n" + annotate(versionmajr, "cancel code: #{versionmajv}", versionminr, "cancel code: #{versionminv}")
-        processidv, processidr = int32
-        _, secretkeyr = bytes(lenv - 12) # 12 bytes = skipping the 3 int32s we already read
-        s += "\n" + annotate(processidr, "target backend process ID: #{processidv}")
+        pidv, pidr = int32
+        secretkeyv, secretkeyr = bytes(lenv - 12) # 12 bytes = skipping the 3 int32s we already read
+        s += "\n" + annotate(pidr, "target backend process ID: #{pidv}")
         s += "\n" + annotate(secretkeyr, "target backend secret key")
+        $conn_data.mutate(@conn_num) { |data| data.update({ cancel_key: "#{pidv}-#{secretkeyv}" }) }
 
       else
         s += annotate(lenr, "#{lenv} bytes of startup message")
@@ -318,9 +356,10 @@ class PgMessage
 
         when "K"
           pidv, pidr = int32
-          s += "\n" + annotate(pidr, "process ID #{pidv}")
-          _, secretkeyr = bytes(lenv - 8)
+          s += "\n" + annotate(pidr, "process ID: #{pidv}")
+          secretkeyv, secretkeyr = bytes(lenv - 8)
           s += "\n" + annotate(secretkeyr, "secret key")
+          $conn_data["#{pidv}-#{secretkeyv}"] = @conn_num
           "BackendKeyData"
 
         when "N"; "NoticeResponse"
@@ -329,8 +368,7 @@ class PgMessage
           authtypev, authtyper = int32
 
           # save this to help interpret 'p' message later
-          conn_thread = Thread.current[:conn_thread] || Thread.current
-          conn_thread[:prev_auth_type] = authtypev
+          $conn_data.mutate(@conn_num) { |data| data.update({ prev_auth_type: authtypev }) }
 
           auth_msg_name = case authtypev
           when 0; "AuthenticationOk"
@@ -533,8 +571,8 @@ class PgMessage
 
         when "p"
           # p can mean various things depending on context, so we need to check the last message sent the other way
-          conn_thread = Thread.current[:conn_thread] || Thread.current
-          case conn_thread[:prev_auth_type]
+          prev_auth_type = $conn_data[@conn_num][:prev_auth_type]
+          case prev_auth_type
           when 3 # AuthenticationCleartextPassword
             _, pwdr = cstr
             s += annotate(REDACT ? "[redacted]" : pwdr, "password")
@@ -585,8 +623,8 @@ def pg_msg(type, msg)
   bin_str(type + [msg.length + 4].pack("N") + msg)
 end
 
-def pg_send(sock, rawmsgs, source = nil)
-  rawmsgs.each { |msg| yield PgMessage.new(msg, source).inspect } if block_given?
+def pg_send(sock, rawmsgs, conn_num, source = nil)
+  rawmsgs.each { |msg| yield PgMessage.new(msg, source, conn_num).inspect } if block_given?
   bytes = rawmsgs.join
   if BYTE_WRITE
     bytes.each_char { |char| sock.write(char) }
@@ -640,21 +678,21 @@ class PGConnection < BufferingConnection
     @source = source # :server, :client, :startup or nil
   end
 
-  def next_message(blocking = true)
+  def next_message(conn_num, blocking = true)
     # if blocking: returns message, or nil at EOF
     # if non-blocking: returns message, or false if none available, or nil at EOF
     result = buffer_to(5, blocking) or return result
     length_incl = @buffer[1...5].unpack1("N")
     result = buffer_to(1 + length_incl, blocking) or return result # 1 + not 5 +, because len is inclusive
     msg = @buffer.slice!(0..length_incl) # inclusive length accounts for the first (message type) byte
-    yield PgMessage.new(msg, @source).inspect if block_given?
+    yield PgMessage.new(msg, @source, conn_num).inspect if block_given?
     msg
   end
 
-  def available_messages(&blk)
+  def available_messages(conn_num, &blk)
     messages = []
     while true do
-      nm = next_message(messages.empty?, &blk)
+      nm = next_message(conn_num, messages.empty?, &blk)
       return nil if nm.nil? && messages.empty?
       break unless nm
       messages << nm
@@ -733,7 +771,9 @@ end
 
 ssl_request = [8, (1234 << 16) + 5679].pack("NN")
 server = TCPServer.new(options[:listen_ip], options[:listen_port])
+
 conn_num = 0
+$conn_data = SafeHash.new # cancel_key => conn_num, conn_num => { host, cancel_key, prev_auth_type }
 
 def conn_num_str(conn_num)
   colour(Colour::CONN, "\##{conn_num}  ")
@@ -747,20 +787,21 @@ loop do
     begin
       # make sure these names are defined in the ensure block
       server_sock = client_to_server_thread = server_to_client_thread = nil
-      puts "#{conn_num_str(conn_num)}connected at t0 = #{Time.now}"
-
+      
+      # consistent connection-related log formatting, capturing conn_num
       cnputs = lambda do |*args|
-        args.each_with_index do |arg, i|
-          arg.split("\n").each_with_index do |line, j|
-            puts "#{conn_num_str(conn_num)}#{i == 0 && j == 0 ? "" : "  "}#{line}"
-          end
-        end
+        puts(args.join("\n").each_line.each_with_index.reduce("") do |memo, (line, i)|
+          memo + "#{conn_num_str(conn_num)}#{i == 0 ? "" : "  "}#{line}"
+        end)
       end
 
       early_exit = lambda do |msg|
         cnputs.("disconnected #{msg}")
         Thread.exit
       end
+      
+      cnputs.("connected at t0 = #{Time.now}")
+      $conn_data.mutate(conn_num) { |data| data ||= {} }
 
       target_via_sni = nil
       t0 = t_now
@@ -847,14 +888,38 @@ loop do
 
       startup_msg = client_sock.read(len - 8)
       full_startup = first_eight + startup_msg
-      cnputs.(client_to_script(PgMessage.new(full_startup, :startup).inspect))
+      cnputs.(client_to_script(PgMessage.new(full_startup, :startup, conn_num).inspect))
 
       username = nil
       startup_msg.split("\x00").each_slice(2) { |x| username = x[1] if x[0] == "user" }
 
-      server_name = options[:target] || (target_via_sni ? target_via_sni.chomp(options[:delete_host_suffix]) : "localhost")
-      cnputs.("connecting to Postgres server: #{server_name}")
+      # fixed host specified? we'll use that
+      server_name = options[:target]
 
+      # no? then use SNI from TLS handshake, if it exists
+      server_name ||= target_via_sni.chomp(options[:delete_host_suffix]) if target_via_sni
+
+      # still no? then see if this is a cancel request and use the stored host
+      unless server_name
+        cancel_key = $conn_data[conn_num][:cancel_key]
+        if cancel_key
+          cancel_conn_num = $conn_data[cancel_key]
+          if cancel_conn_num
+            conn_datum = $conn_data[cancel_conn_num]
+            if conn_datum
+              server_name = conn_datum[:server_name]
+              cnputs.("using remembered host for CancelRequest connection") if server_name
+            end
+          end
+        end
+      end
+
+      # failing all of that, fall back to localhost
+      server_name ||= "localhost"
+
+      cnputs.("connecting to Postgres server: #{server_name}")
+      $conn_data.mutate(conn_num) { |data| data.update({ server_name: server_name }) }
+      
       if connecting_to_self?(server_name, options[:connect_port], options[:listen_ip], options[:listen_port]) && !options[:allow_self_loop]
         early_exit.("to avoid possible infinite loop: host + port for listen and connect are the same (disable this check with --allow-self-loop)")
       end
@@ -915,7 +980,7 @@ loop do
 
       cnputs.("forwarding client startup message to server")
       server_sock.write(full_startup)
-      cnputs.(script_to_server(PgMessage.new(full_startup, :startup).inspect))
+      cnputs.(script_to_server(PgMessage.new(full_startup, :startup, conn_num).inspect))
 
       server_reader = PGConnection.new(server_sock, :server)
       client_reader = PGConnection.new(client_sock, :client)
@@ -924,34 +989,34 @@ loop do
 
       if options[:force_password] # request password from client, and use it to do either password or SCRAM auth with server
         cnputs.("now overriding authentication")
-        auth_msg = server_reader.next_message { |str| cnputs.(server_to_script(str)) }
+        auth_msg = server_reader.next_message(conn_num) { |str| cnputs.(server_to_script(str)) }
         early_exit.("awaiting auth message") if auth_msg.nil?
         raise "expected auth message" unless auth_msg[0] == "R"
 
         auth_type = auth_msg[5..8].unpack1("N")
         if auth_type == 0
           cnputs.("forwarding AuthenticationOk message to client")
-          pg_send(client_sock, [auth_msg], :server) { |str| cnputs.(script_to_client(str)) }
+          pg_send(client_sock, [auth_msg], conn_num, :server) { |str| cnputs.(script_to_client(str)) }
 
         else
           # request cleartext password from client
-          pg_send(client_sock, [pg_msg("R", "\x00\x00\x00\x03")], :server) { |str| cnputs.(script_to_client(str)) }
-          pwd_msg = client_reader.next_message(true) { |str| cnputs.(client_to_script(str)) }
+          pg_send(client_sock, [pg_msg("R", "\x00\x00\x00\x03")], conn_num, :server) { |str| cnputs.(script_to_client(str)) }
+          pwd_msg = client_reader.next_message(conn_num) { |str| cnputs.(client_to_script(str)) }
           early_exit.("for client to request password") if pwd_msg.nil?
           raise "expected password message" unless pwd_msg[0] == "p"
           pwd = pwd_msg[5..].unpack1("Z*") # remove null terminator
 
           # silently re-parse the auth message so as to keep track of the auth protocol stage we're at with the server
-          PgMessage.new(auth_msg, :server).inspect
+          PgMessage.new(auth_msg, :server, conn_num).inspect
 
           case auth_type
           when 3 # AuthenticationCleartextPassword -> forward the client's message on
-            pg_send(server_sock, [pwd_msg], :client) { |str| cnputs.(script_to_server(str)) }
+            pg_send(server_sock, [pwd_msg], conn_num, :client) { |str| cnputs.(script_to_server(str)) }
 
           when 5 # AuthenticationMD5
             salt = auth_msg[9..]
             md5 = Digest::MD5.hexdigest(Digest::MD5.hexdigest(pwd + username) + salt)
-            pg_send(server_sock, [pg_msg("p", "md5#{md5}\x00")], :client) { |str| cnputs.(script_to_server(str)) }
+            pg_send(server_sock, [pg_msg("p", "md5#{md5}\x00")], conn_num, :client) { |str| cnputs.(script_to_server(str)) }
 
           when 10 # AuthenticationSASL
             unless has_sasl
@@ -969,16 +1034,16 @@ loop do
             auth = authenticators[mechanism].new(username: "*", password: pwd, ssl_cert: options[:channel_binding] == 'disable' ? nil : server_sock.peer_cert)
             client_initial_msg = auth.process(nil)
             scram_msg = bin_str("#{mechanism}\x00#{[client_initial_msg.length].pack("N")}#{client_initial_msg}")
-            pg_send(server_sock, [pg_msg("p", scram_msg)], :client) { |str| cnputs.(script_to_server(str)) }
+            pg_send(server_sock, [pg_msg("p", scram_msg)], conn_num, :client) { |str| cnputs.(script_to_server(str)) }
 
-            server_first_msg = server_reader.next_message { |str| cnputs.(server_to_script(str)) }
+            server_first_msg = server_reader.next_message(conn_num) { |str| cnputs.(server_to_script(str)) }
             early_exit.("awaiting AuthenticationSASLContinue") if server_first_msg.nil?
             raise "expected AuthenticationSASLContinue" unless server_first_msg[0] == "R" && server_first_msg[5..8] == bin_str("\x00\x00\x00\x0b")
 
             client_final_msg = auth.process(server_first_msg[9..])
-            pg_send(server_sock, [pg_msg("p", client_final_msg)], :client) { |str| cnputs.(script_to_server(str)) }
+            pg_send(server_sock, [pg_msg("p", client_final_msg)], conn_num, :client) { |str| cnputs.(script_to_server(str)) }
 
-            server_final_message = server_reader.next_message { |str| cnputs.(server_to_script(str)) }
+            server_final_message = server_reader.next_message(conn_num) { |str| cnputs.(server_to_script(str)) }
             early_exit.("awaiting AuthenticationSASLFinal") if server_final_message.nil?
             raise "expected AuthenticationSASLFinal" unless server_final_message[0] == "R" && server_final_message[5..8] == bin_str("\x00\x00\x00\x0c")
 
@@ -998,32 +1063,30 @@ loop do
       exit_queue = Queue.new
 
       # pass messages from server to client
-      server_to_client_thread = Thread.new(Thread.current) do |parent_thread|
-        Thread.current[:conn_thread] = parent_thread
+      server_to_client_thread = Thread.new do
         while true do
-          messages = server_reader.available_messages { |str| cnputs.(server_to_client(str)) if log_proxied }
+          messages = server_reader.available_messages(conn_num) { |str| cnputs.(server_to_client(str)) if log_proxied }
           if messages.nil?
             cnputs.("server hung up")
             exit_queue.push(:server_eof)
             break
           end
-          bytes_sent = pg_send(client_sock, messages)
+          bytes_sent = pg_send(client_sock, messages, conn_num)
           bytes_left = server_reader.buffer.length
           cnputs.(colour(Colour::LEN, "^^ #{bytes_sent} bytes forwarded #{BYTE_WRITE ? 'one by one ' : ''}at +#{(t_now - t0).floor(2)}s#{bytes_left > 0 ? ", #{bytes_left} bytes left in buffer" : ""}")) if log_proxied
         end
       end
 
       # pass messages from client to server
-      client_to_server_thread = Thread.new(Thread.current) do |parent_thread|
-        Thread.current[:conn_thread] = parent_thread
+      client_to_server_thread = Thread.new do
         while true do
-          messages = client_reader.available_messages { |str| cnputs.(client_to_server(str)) if log_proxied }
+          messages = client_reader.available_messages(conn_num) { |str| cnputs.(client_to_server(str)) if log_proxied }
           if messages.nil?
             cnputs.("client hung up")
             exit_queue.push(:client_eof)
             break
           end
-          bytes_sent = pg_send(server_sock, messages)
+          bytes_sent = pg_send(server_sock, messages, conn_num)
           bytes_left = client_reader.buffer.length
           cnputs.(colour(Colour::LEN, "^^ #{bytes_sent} bytes forwarded #{BYTE_WRITE ? 'one by one ' : ''}at +#{(t_now - t0).floor(2)}s#{bytes_left > 0 ? ", #{bytes_left} bytes left in buffer" : ""}")) if log_proxied
         end
@@ -1038,6 +1101,8 @@ loop do
       server_to_client_thread.kill unless server_to_client_thread.nil?
       client_sock.close unless client_sock.nil?
       server_sock.close unless server_sock.nil?
+      $conn_data.delete($conn_data[conn_num][:cancel_key])
+      $conn_data.delete(conn_num)
     end
   end
 
