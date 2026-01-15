@@ -188,6 +188,9 @@ class SafeHash
   def mutate(key)
     @mutex.synchronize { @hash[key] = yield(@hash[key]) }
   end
+  def inspect
+    @hash.inspect
+  end
 end
 
 
@@ -257,7 +260,7 @@ class PgMessage
         secretkeyv, secretkeyr = bytes(lenv - 12) # 12 bytes = skipping the 3 int32s we already read
         s += "\n" + annotate(pidr, "target backend process ID: #{pidv}")
         s += "\n" + annotate(secretkeyr, "target backend secret key")
-        $conn_data.mutate(@conn_num) { |data| data.update({ cancel_key: "#{pidv}-#{secretkeyv}" }) }
+        $conn_data.mutate(@conn_num) { |data| data.update({ is_cancelrequest_with_key: "#{pidv}-#{secretkeyv}" }) }
 
       else
         s += annotate(lenr, "#{lenv} bytes of startup message")
@@ -359,7 +362,9 @@ class PgMessage
           s += "\n" + annotate(pidr, "process ID: #{pidv}")
           secretkeyv, secretkeyr = bytes(lenv - 8)
           s += "\n" + annotate(secretkeyr, "secret key")
-          $conn_data["#{pidv}-#{secretkeyv}"] = @conn_num
+          cancel_key = "#{pidv}-#{secretkeyv}"
+          $conn_data[cancel_key] = @conn_num
+          $conn_data.mutate(@conn_num) { |data| data.update({ cancel_key: cancel_key }) }
           "BackendKeyData"
 
         when "N"; "NoticeResponse"
@@ -773,7 +778,8 @@ ssl_request = [8, (1234 << 16) + 5679].pack("NN")
 server = TCPServer.new(options[:listen_ip], options[:listen_port])
 
 conn_num = 0
-$conn_data = SafeHash.new # cancel_key => conn_num, conn_num => { host, cancel_key, prev_auth_type }
+$conn_data = SafeHash.new # cancel_key => conn_num, conn_num => { host, cancel_key / is_cancelrequest_with_key, prev_auth_type }
+trap("HUP") { puts("conn_data: #{$conn_data.inspect}") }
 
 def conn_num_str(conn_num)
   colour(Colour::CONN, "\##{conn_num}  ")
@@ -901,7 +907,7 @@ loop do
 
       # still no? then see if this is a cancel request and use the stored host
       unless server_name
-        cancel_key = $conn_data[conn_num][:cancel_key]
+        cancel_key = $conn_data[conn_num][:is_cancelrequest_with_key]
         if cancel_key
           cancel_conn_num = $conn_data[cancel_key]
           if cancel_conn_num
