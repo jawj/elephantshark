@@ -143,18 +143,19 @@ def client_to_server(s) "#{colour(Colour::C2S, "client -> server:")} #{s}" end
 def client_to_script(s) "#{colour(Colour::C2S, "client -> script:")} #{s}" end
 def script_to_server(s) "#{colour(Colour::C2S, "script -> server:")} #{s}" end
 
-# Ruby compatibility checks
+# compatibility checks
 
 case RUBY_ENGINE
 when "ruby", "truffleruby"
   # MRI: supported
-  # TruffleRuby: seems to work
+  # TruffleRuby: passes all tests
 when "jruby"
-  # JRuby: `recv(n, Socket::MSG_PEEK)` is missing as of v10
+  # JRuby: fails (as of v10) because `recv(n, Socket::MSG_PEEK)` is missing
   puts(colour(Colour::WARN, "JRuby is not compatible with elephantshark: expect trouble"))
 else
   # mruby: already failed at `require`
   # picoruby: already failed parsing Regexp literals
+  # others ... ?
   puts(colour(Colour::WARN, "RUBY_ENGINE '#{RUBY_ENGINE}': compatibility unknown"))
 end
 
@@ -192,7 +193,6 @@ class SafeHash
     @hash.inspect
   end
 end
-
 
 # Postgres message parsing/annotation
 
